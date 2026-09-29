@@ -44,7 +44,7 @@ Run it locally (Python 3.11+, ODBC Driver 17 for SQL Server):
 ```bash
 cd backend
 python -m venv .venv
-.venv\Scriptsctivate          # macOS/Linux: source .venv/bin/activate
+.venv\Scripts\activate          # macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env              # fill in READER_DB_*, AWS_*, SECRET_KEY -- never commit .env
 python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
