@@ -8,6 +8,15 @@ mobile app.
 Built with React 19 + TypeScript + Vite. It is a static site — all data comes from the existing
 FastAPI backend over HTTPS.
 
+## Repository layout
+
+```
+/            the website (React + Vite) -- this is what Vercel builds and hosts
+backend/     the FastAPI backend (Python) -- runs on its own server, not on Vercel
+```
+
+`.vercelignore` keeps `backend/` out of the Vercel deployment.
+
 ## Backend
 
 | | |
@@ -24,7 +33,32 @@ Endpoints used: `/api/auth/*`, `/api/admin/claims`, `/api/claims/*`, `/api/appro
 `/api/admin/claims/{id}/mark-paid`, `/api/vendors`, `/api/notifications/*`, and
 `/api/admin/activity` (the dashboard's activity feed; shows a notice if the backend doesn't have it yet).
 
-## Run locally
+## Backend code (`backend/`)
+
+FastAPI + SQLAlchemy on the ERP-Dev SQL Server, JWT auth, receipt images in S3, RapidOCR for bill
+reading. It is already deployed at `https://expensetracker-api.app-brisigns.com`
+(Ubuntu server, PM2 process `expensetracker-api`); the website does not need it running locally.
+
+Run it locally (Python 3.11+, ODBC Driver 17 for SQL Server):
+
+```bash
+cd backend
+python -m venv .venv
+.venv\Scriptsctivate          # macOS/Linux: source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env              # fill in READER_DB_*, AWS_*, SECRET_KEY -- never commit .env
+python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
+```
+
+Then point the website at it with `VITE_API_BASE_URL=http://127.0.0.1:8000`.
+
+Tests: `python -m pytest` inside `backend/` (pure unit tests, no database needed, but the
+`READER_DB_*` settings must be present in `.env` for the config to load).
+
+**Never committed:** `backend/.env` (database password, AWS keys, JWT secret), `backend/uploads/`
+(real receipt photos), `*.db`, `.venv/` -- see `backend/.gitignore`.
+
+## Run the website locally
 
 ```bash
 npm install

@@ -1,0 +1,554 @@
+import json
+from datetime import datetime
+from typing import Any, Optional
+
+from sqlalchemy.orm import Session, joinedload
+
+from auth.security import CurrentUser
+from database.models import (
+    ErpAuthExpenseUsers,
+    ErpExpenseApprovalHistory,
+    ErpExpenseCategory,
+    ErpExpenseDocument,
+    ErpExpenseRegionConfig,
+    ErpExpenseTransaction,
+    ErpExpenseVendor,
+)
+from services.ocr_service import ocr_service, refresh_reference_data
+from services.storage import storage_service
+
+
+def _field_confidence_json(document: Optional[ErpExpenseDocument]) -> Optional[str]:
+    if not document or not document.ocr_raw_json:
+        return None
+    try:
+        data = json.loads(document.ocr_raw_json) if isinstance(document.ocr_raw_json, str) else document.ocr_raw_json
+        if isinstance(data, str):
+            data = json.loads(data)
+        confidence = data.get("field_confidence") if isinstance(data, dict) else None
+        return json.dumps(confidence) if confidence else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _history(db: Session, transaction_id: int, actor_id: int, stage: str, action: str, comment: Optional[str] = None) -> None:
+    db.add(
+        ErpExpenseApprovalHistory(
+            transaction_id=transaction_id,
+            stage=stage,
+            actor_id=actor_id,
+            action=action,
+            comment=comment,
+        )
+    )
+
+
+def _resolve_vendor(db: Session, vendor_name: Optional[str]) -> Optional[ErpExpenseVendor]:
+    # Exact-match lookup only -- no auto-create on a miss. A miss (new vendor, or OCR/typo
+    # variance on a known one) is left unmatched and surfaced to the Accountant via
+    # vendor_raw_text / vendor_unmatched instead of silently fragmenting the vendor table
+    # with near-duplicate rows ("Uber" / "uber" / "Ubar").
+    if not vendor_name or not vendor_name.strip():
+        return None
+    vendor_name = vendor_name.strip()
+    return db.query(ErpExpenseVendor).filter(ErpExpenseVendor.vendor_name == vendor_name).first()
+
+
+def _resolve_region(db: Session, region_code: str) -> ErpExpenseRegionConfig:
+    region = db.query(ErpExpenseRegionConfig).filter(ErpExpenseRegionConfig.region_code == region_code).first()
+    if not region:
+        raise ValueError(f"Unknown region_code: {region_code}")
+    return region
+
+
+def transaction_to_dict(
+    txn: ErpExpenseTransaction,
+    include_history: bool = False,
+    db: Optional[Session] = None,
+) -> dict[str, Any]:
+    document = txn.documents[0] if txn.documents else None
+    data: dict[str, Any] = {
+        "id": txn.transaction_id,
+        "type": txn.type,
+        "employee_id": txn.employee_id,
+        "employee_name": txn.employee.display_name if txn.employee else None,
+        "region_id": txn.region_id,
+        "region_code": txn.region.region_code if txn.region else None,
+        "project_id": txn.project_cache_id,
+        "category_id": txn.category_id,
+        "category_name": txn.category.category_name if txn.category else None,
+        "vendor_id": txn.vendor_id,
+        "vendor_name": txn.vendor.vendor_name if txn.vendor else txn.vendor_raw_text,
+        "vendor_unmatched": bool(txn.vendor_raw_text) and not txn.vendor_id,
+        "bill_date": txn.bill_date,
+        "currency": txn.currency,
+        "exchange_rate": txn.exchange_rate,
+        "amount": txn.amount,
+        "vat_amount": txn.vat_amount,
+        "total_amount": txn.total_amount,
+        "op_number": txn.op_number,
+        "status": txn.status,
+        "current_stage": txn.current_stage,
+        "dispute_returned": bool(txn.dispute_returned),
+        "remarks": txn.remarks,
+        "duplicate_flag": bool(txn.duplicate_flag),
+        "ocr_confidence_json": txn.ocr_confidence_json,
+        "created_at": txn.created_on.isoformat() if txn.created_on else None,
+        "updated_at": txn.modified_on.isoformat() if txn.modified_on else None,
+        "submitted_at": txn.submitted_on.isoformat() if txn.submitted_on else None,
+        "decided_at": txn.decided_on.isoformat() if txn.decided_on else None,
+        "paid_at": txn.paid_on.isoformat() if txn.paid_on else None,
+        "receipt": None,
+        "duplicate_warning": None,
+        "stage_sequence": [],
+    }
+    if db is not None:
+        # Lazy import avoids a circular import with approval_service.py.
+        from services.approval_service import resolve_stage_sequence
+
+        try:
+            data["stage_sequence"] = resolve_stage_sequence(db, txn)
+        except Exception:
+            data["stage_sequence"] = []
+    if document:
+        proxy = f"/api/claims/receipts/{document.document_id}/image"
+        signed = storage_service.presigned_url(document.s3_key)
+        data["receipt"] = {
+            "id": document.document_id,
+            "s3_key": document.s3_key,
+            "content_type": document.content_type,
+            "ocr_vendor": document.ocr_vendor,
+            "ocr_amount": document.ocr_amount,
+            "ocr_vat_amount": document.ocr_vat_amount,
+            "ocr_total_amount": document.ocr_total_amount,
+            "ocr_currency": document.ocr_currency,
+            "ocr_date": document.ocr_date,
+            "ocr_confidence": document.ocr_confidence,
+            "image_hash": document.hash,
+            "image_url": signed or proxy,
+            "image_proxy_url": proxy,
+        }
+    if include_history:
+        data["history"] = [
+            {
+                "id": h.approval_history_id,
+                "stage": h.stage,
+                "actor_id": h.actor_id,
+                "action": h.action,
+                "remarks": h.comment,
+                "created_at": h.acted_on.isoformat() if h.acted_on else None,
+            }
+            for h in sorted(txn.approval_history, key=lambda x: x.acted_on or datetime.min)
+        ]
+    return data
+
+
+class TransactionService:
+    def store_receipt(self, db: Session, image_bytes: bytes, content_type: str, filename: str) -> dict[str, Any]:
+        """Upload to S3 and insert the document row. Does not run OCR."""
+        key = storage_service.save_bytes(
+            image_bytes,
+            content_type=content_type,
+            ext=(filename.rsplit(".", 1)[-1] if "." in filename else "jpg"),
+        )
+        img_hash = storage_service.image_hash(image_bytes)
+        document = ErpExpenseDocument(
+            transaction_id=None,
+            s3_key=key,
+            content_type=content_type,
+            hash=img_hash,
+        )
+        db.add(document)
+        db.commit()
+        db.refresh(document)
+        return self._receipt_payload(document, ocr=None, duplicate=None, ocr_status="pending")
+
+    def analyze_receipt(self, db: Session, receipt_id: int, mode: str = "auto", employee_id: Optional[int] = None) -> dict[str, Any]:
+        document = self.get_receipt(db, receipt_id)
+        image_bytes = storage_service.read_bytes(document.s3_key)
+        if not image_bytes:
+            raise LookupError("Receipt image not found in storage")
+        refresh_reference_data(db)
+        ocr = ocr_service.run(image_bytes, "receipt.jpg", mode=mode)
+        document.ocr_raw_json = (
+            ocr.get("raw_json") if isinstance(ocr.get("raw_json"), str) else json.dumps(ocr.get("raw_json"))
+        )
+        document.ocr_vendor = ocr.get("vendor") or None
+        document.ocr_amount = ocr.get("amount")
+        document.ocr_vat_amount = ocr.get("vat_amount")
+        document.ocr_total_amount = ocr.get("total_amount")
+        document.ocr_currency = ocr.get("currency")
+        document.ocr_date = ocr.get("date") or None
+        document.ocr_confidence = ocr.get("confidence")
+        db.commit()
+        db.refresh(document)
+        duplicate = self._find_duplicate(
+            db, ocr.get("vendor"), ocr.get("amount"), ocr.get("date"), employee_id=employee_id
+        )
+        return self._receipt_payload(document, ocr=ocr, duplicate=duplicate, ocr_status="done")
+
+    def run_ocr(self, db: Session, image_bytes: bytes, content_type: str, filename: str, employee_id: Optional[int] = None) -> dict[str, Any]:
+        stored = self.store_receipt(db, image_bytes, content_type, filename)
+        return self.analyze_receipt(db, stored["receipt_id"], employee_id=employee_id)
+
+    def _receipt_payload(
+        self,
+        document: ErpExpenseDocument,
+        *,
+        ocr: Optional[dict[str, Any]],
+        duplicate: Optional[dict[str, Any]],
+        ocr_status: str,
+    ) -> dict[str, Any]:
+        proxy = f"/api/claims/receipts/{document.document_id}/image"
+        signed = storage_service.presigned_url(document.s3_key)
+        ocr = ocr or {}
+        return {
+            "receipt_id": document.document_id,
+            "s3_key": document.s3_key,
+            "ocr_status": ocr_status,
+            "vendor": ocr.get("vendor") or document.ocr_vendor or "",
+            "expense_type": ocr.get("expense_type"),
+            "amount": ocr.get("amount", document.ocr_amount),
+            "vat_amount": ocr.get("vat_amount", document.ocr_vat_amount),
+            "total_amount": ocr.get("total_amount", document.ocr_total_amount),
+            "currency": ocr.get("currency") or document.ocr_currency,
+            "date": ocr.get("date") or document.ocr_date or "",
+            "confidence": ocr.get("confidence", document.ocr_confidence),
+            "field_confidence": ocr.get("field_confidence") or {},
+            "low_confidence_fields": ocr.get("low_confidence_fields") or [],
+            "reconciliation_mismatch": ocr.get("reconciliation_mismatch") or False,
+            "raw_text": ocr.get("raw_text"),
+            "image_hash": document.hash,
+            "image_url": signed or proxy,
+            "image_proxy_url": proxy,
+            "duplicate_warning": duplicate,
+        }
+
+    def _find_duplicate(
+        self,
+        db: Session,
+        vendor_name: Optional[str],
+        amount: Optional[float],
+        bill_date: Optional[str],
+        exclude_transaction_id: Optional[int] = None,
+        employee_id: Optional[int] = None,
+    ) -> Optional[dict[str, Any]]:
+        # Same-image-hash matching was dropped — re-uploading an identical photo isn't evidence of duplication on its own; same vendor+amount+date is.
+        # Scoped to the same employee: two different employees legitimately spending the same
+        # amount at the same vendor on the same day (e.g. a common fixed-fare taxi route) is a
+        # coincidence, not a duplicate -- only the same person resubmitting/reusing a bill is.
+        if vendor_name and amount is not None and bill_date and employee_id is not None:
+            vendor = db.query(ErpExpenseVendor).filter(ErpExpenseVendor.vendor_name == vendor_name).first()
+            if vendor:
+                q = db.query(ErpExpenseTransaction).filter(
+                    ErpExpenseTransaction.vendor_id == vendor.vendor_id,
+                    ErpExpenseTransaction.amount == amount,
+                    ErpExpenseTransaction.bill_date == bill_date,
+                    ErpExpenseTransaction.employee_id == employee_id,
+                    ErpExpenseTransaction.status != "rejected",
+                )
+                if exclude_transaction_id:
+                    q = q.filter(ErpExpenseTransaction.transaction_id != exclude_transaction_id)
+                hit_txn = q.first()
+                if hit_txn:
+                    return {
+                        "reason": "same_vendor_amount_date",
+                        "existing_claim_id": hit_txn.transaction_id,
+                        "message": "This employee already has another claim with the same vendor, amount, and date.",
+                    }
+        return None
+
+    def create_claim(
+        self,
+        db: Session,
+        user: CurrentUser,
+        *,
+        vendor: str,
+        amount: float,
+        vat_amount: float = 0.0,
+        total_amount: Optional[float] = None,
+        currency: str = "AED",
+        exchange_rate: float = 1.0,
+        bill_date: Optional[str],
+        category_id: int,
+        region_code: str,
+        type: str = "reimbursement",
+        project_id: Optional[int],
+        op_number: Optional[str],
+        remarks: Optional[str],
+        receipt_id: Optional[int],
+        s3_key: Optional[str],
+        submit: bool = True,
+    ) -> dict[str, Any]:
+        region = _resolve_region(db, region_code)
+        category = db.query(ErpExpenseCategory).filter(ErpExpenseCategory.category_id == category_id).first()
+        if not category:
+            raise ValueError("Unknown category_id")
+        vendor_obj = _resolve_vendor(db, vendor)
+
+        txn = ErpExpenseTransaction(
+            type=type,
+            employee_id=user.id,
+            region_id=region.region_id,
+            project_cache_id=project_id,
+            category_id=category.category_id,
+            vendor_id=vendor_obj.vendor_id if vendor_obj else None,
+            vendor_raw_text=None if vendor_obj else (vendor.strip() if vendor and vendor.strip() else None),
+            bill_date=bill_date,
+            currency=currency,
+            exchange_rate=exchange_rate,
+            amount=amount,
+            vat_amount=vat_amount,
+            total_amount=total_amount if total_amount is not None else amount + vat_amount,
+            op_number=op_number,
+            remarks=remarks,
+            status="submitted" if submit else "draft",
+            submitted_on=datetime.utcnow() if submit else None,
+        )
+        db.add(txn)
+        db.flush()
+
+        document = None
+        if receipt_id:
+            document = db.query(ErpExpenseDocument).filter(ErpExpenseDocument.document_id == receipt_id).first()
+        elif s3_key:
+            document = db.query(ErpExpenseDocument).filter(ErpExpenseDocument.s3_key == s3_key).first()
+        if document:
+            document.transaction_id = txn.transaction_id
+            txn.ocr_confidence_json = _field_confidence_json(document)
+
+        _history(db, txn.transaction_id, user.id, "employee", "created" if not submit else "submitted")
+
+        duplicate = self._find_duplicate(db, vendor, amount, bill_date, txn.transaction_id, employee_id=txn.employee_id)
+        txn.duplicate_flag = 1 if duplicate else 0
+
+        db.commit()
+        txn = (
+            db.query(ErpExpenseTransaction)
+            .options(
+                joinedload(ErpExpenseTransaction.documents),
+                joinedload(ErpExpenseTransaction.approval_history),
+                joinedload(ErpExpenseTransaction.region),
+                joinedload(ErpExpenseTransaction.category),
+                joinedload(ErpExpenseTransaction.vendor),
+            )
+            .filter(ErpExpenseTransaction.transaction_id == txn.transaction_id)
+            .one()
+        )
+        result = transaction_to_dict(txn, include_history=True, db=db)
+        result["duplicate_warning"] = duplicate
+
+        if submit:
+            self._notify_finance_on_submit(db, txn)
+        return result
+
+    def update_draft(self, db: Session, user: CurrentUser, transaction_id: int, updates: dict[str, Any]) -> dict[str, Any]:
+        txn = self._owned_transaction(db, user, transaction_id)
+        if txn.status != "draft":
+            raise ValueError("Only draft claims can be edited")
+
+        if "vendor" in updates and updates["vendor"]:
+            vendor_obj = _resolve_vendor(db, updates["vendor"])
+            txn.vendor_id = vendor_obj.vendor_id if vendor_obj else None
+            txn.vendor_raw_text = None if vendor_obj else updates["vendor"].strip()
+        for field, attr in (
+            ("amount", "amount"),
+            ("vat_amount", "vat_amount"),
+            ("total_amount", "total_amount"),
+            ("bill_date", "bill_date"),
+            ("category_id", "category_id"),
+            ("project_id", "project_cache_id"),
+            ("op_number", "op_number"),
+            ("remarks", "remarks"),
+        ):
+            if field in updates and updates[field] is not None:
+                setattr(txn, attr, updates[field])
+        _history(db, txn.transaction_id, user.id, "employee", "edited")
+        db.commit()
+        return self.get_claim(db, user, transaction_id)
+
+    def submit_claim(self, db: Session, user: CurrentUser, transaction_id: int) -> dict[str, Any]:
+        txn = self._owned_transaction(db, user, transaction_id)
+        if txn.status not in ("draft",):
+            raise ValueError("Only draft claims can be submitted")
+        txn.status = "submitted"
+        txn.submitted_on = datetime.utcnow()
+        # Re-check for duplicates at submission time — draft edits can change vendor/amount/date after the initial check, making it stale.
+        duplicate = self._find_duplicate(
+            db, txn.vendor.vendor_name if txn.vendor else None, txn.amount, txn.bill_date, txn.transaction_id,
+            employee_id=txn.employee_id,
+        )
+        txn.duplicate_flag = 1 if duplicate else 0
+        _history(db, txn.transaction_id, user.id, "employee", "submitted")
+        db.commit()
+        self._notify_finance_on_submit(db, txn)
+        return self.get_claim(db, user, transaction_id)
+
+    def list_mine(self, db: Session, user: CurrentUser) -> list[dict[str, Any]]:
+        txns = (
+            db.query(ErpExpenseTransaction)
+            .options(
+                joinedload(ErpExpenseTransaction.documents),
+                joinedload(ErpExpenseTransaction.region),
+                joinedload(ErpExpenseTransaction.category),
+                joinedload(ErpExpenseTransaction.vendor),
+            )
+            .filter(ErpExpenseTransaction.employee_id == user.id)
+            .order_by(ErpExpenseTransaction.created_on.desc())
+            .all()
+        )
+        return [transaction_to_dict(t, db=db) for t in txns]
+
+    def get_claim(self, db: Session, user: CurrentUser, transaction_id: int) -> dict[str, Any]:
+        txn = (
+            db.query(ErpExpenseTransaction)
+            .options(
+                joinedload(ErpExpenseTransaction.documents),
+                joinedload(ErpExpenseTransaction.approval_history),
+                joinedload(ErpExpenseTransaction.region),
+                joinedload(ErpExpenseTransaction.category),
+                joinedload(ErpExpenseTransaction.vendor),
+            )
+            .filter(ErpExpenseTransaction.transaction_id == transaction_id)
+            .first()
+        )
+        if not txn:
+            raise LookupError("Claim not found")
+        if txn.employee_id != user.id and not user.is_approver:
+            raise PermissionError("Not allowed")
+        data = transaction_to_dict(txn, include_history=True, db=db)
+        if txn.documents:
+            data["duplicate_warning"] = self._find_duplicate(
+                db, txn.vendor.vendor_name if txn.vendor else None, txn.amount, txn.bill_date, txn.transaction_id,
+                employee_id=txn.employee_id,
+            )
+        return data
+
+    def list_admin(
+        self,
+        db: Session,
+        *,
+        status: Optional[str] = None,
+        category_id: Optional[int] = None,
+        employee_id: Optional[int] = None,
+        project_id: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        q = db.query(ErpExpenseTransaction).options(
+            joinedload(ErpExpenseTransaction.documents),
+            joinedload(ErpExpenseTransaction.region),
+            joinedload(ErpExpenseTransaction.category),
+            joinedload(ErpExpenseTransaction.vendor),
+        )
+        if status:
+            q = q.filter(ErpExpenseTransaction.status == status)
+        if category_id:
+            q = q.filter(ErpExpenseTransaction.category_id == category_id)
+        if employee_id:
+            q = q.filter(ErpExpenseTransaction.employee_id == employee_id)
+        if project_id:
+            q = q.filter(ErpExpenseTransaction.project_cache_id == project_id)
+        txns = q.order_by(ErpExpenseTransaction.created_on.desc()).all()
+        return [transaction_to_dict(t, db=db) for t in txns]
+
+    def mark_paid(self, db: Session, user: CurrentUser, transaction_id: int, remarks: Optional[str]) -> dict[str, Any]:
+        txn = self._get(db, transaction_id)
+        if txn.status != "approved":
+            raise ValueError("Only approved claims can be marked paid")
+        txn.status = "paid"
+        txn.paid_on = datetime.utcnow()
+        if remarks:
+            txn.remarks = remarks
+        _history(db, txn.transaction_id, user.id, "finance_manager", "paid", remarks)
+        db.commit()
+        self._notify_employee(db, txn, "paid", remarks)
+        return self.get_claim(db, user, transaction_id)
+
+    def recent_activity(self, db: Session, limit: int = 50) -> list[dict[str, Any]]:
+        """Newest-first feed of every workflow event (submit, approve, dispute, reject, paid, ...)
+        across all claims -- backs the web dashboard's activity panel."""
+        rows = (
+            db.query(ErpExpenseApprovalHistory)
+            .options(
+                joinedload(ErpExpenseApprovalHistory.transaction).joinedload(ErpExpenseTransaction.vendor),
+                joinedload(ErpExpenseApprovalHistory.transaction).joinedload(ErpExpenseTransaction.employee),
+            )
+            .order_by(ErpExpenseApprovalHistory.acted_on.desc())
+            .limit(limit)
+            .all()
+        )
+        actor_ids = {r.actor_id for r in rows}
+        actors = {
+            u.user_id: u.display_name
+            for u in db.query(ErpAuthExpenseUsers).filter(ErpAuthExpenseUsers.user_id.in_(actor_ids)).all()
+        } if actor_ids else {}
+        result = []
+        for r in rows:
+            txn = r.transaction
+            result.append({
+                "id": r.approval_history_id,
+                "transaction_id": r.transaction_id,
+                "stage": r.stage,
+                "action": r.action,
+                "comment": r.comment,
+                "actor_id": r.actor_id,
+                "actor_name": actors.get(r.actor_id),
+                "employee_name": txn.employee.display_name if txn and txn.employee else None,
+                "vendor_name": (txn.vendor.vendor_name if txn.vendor else txn.vendor_raw_text) if txn else None,
+                "currency": txn.currency if txn else None,
+                "total_amount": txn.total_amount if txn else None,
+                "created_at": r.acted_on.isoformat() if r.acted_on else None,
+            })
+        return result
+
+    def get_receipt(self, db: Session, receipt_id: int) -> ErpExpenseDocument:
+        document = db.query(ErpExpenseDocument).filter(ErpExpenseDocument.document_id == receipt_id).first()
+        if not document:
+            raise LookupError("Receipt not found")
+        return document
+
+    def _get(self, db: Session, transaction_id: int) -> ErpExpenseTransaction:
+        txn = db.query(ErpExpenseTransaction).filter(ErpExpenseTransaction.transaction_id == transaction_id).first()
+        if not txn:
+            raise LookupError("Claim not found")
+        return txn
+
+    def _owned_transaction(self, db: Session, user: CurrentUser, transaction_id: int) -> ErpExpenseTransaction:
+        txn = self._get(db, transaction_id)
+        if txn.employee_id != user.id and not user.is_approver:
+            raise PermissionError("Not allowed")
+        return txn
+
+    def _notify_finance_on_submit(self, db: Session, txn: ErpExpenseTransaction) -> None:
+        # Notify only the CURRENT stage's approver, not every approver-capable user — the chain is sequential.
+        from services import approval_service, email_templates, notification_service
+
+        approver = approval_service.resolve_current_approver(db, txn)
+        vendor_name = txn.vendor.vendor_name if txn.vendor else (txn.vendor_raw_text or "unknown vendor")
+        content = email_templates.submission_email(email_templates.build_context(txn))
+        notification_service.send(
+            db, approver, "submission", txn.transaction_id,
+            f"New expense claim submitted ({vendor_name})", f"تم تقديم مطالبة نفقات جديدة ({vendor_name})",
+            f"Claim {txn.transaction_id} for {txn.currency} {txn.amount} is awaiting your review.",
+            f"المطالبة رقم {txn.transaction_id} بمبلغ {txn.currency} {txn.amount} في انتظار مراجعتك.",
+            html_body_en=content.html,
+        )
+
+    def _notify_employee(self, db: Session, txn: ErpExpenseTransaction, action: str, remarks: Optional[str]) -> None:
+        from services import email_templates, notification_service
+
+        employee = db.query(ErpAuthExpenseUsers).filter(ErpAuthExpenseUsers.user_id == txn.employee_id).first()
+        vendor_name = txn.vendor.vendor_name if txn.vendor else (txn.vendor_raw_text or "unknown vendor")
+        action_ar = {"paid": "دفع"}.get(action, action)  # only "paid" is used via this path today
+        html = None
+        if action == "paid":
+            html = email_templates.paid_email(email_templates.build_context(txn, comment=remarks)).html
+        notification_service.send(
+            db, employee, action, txn.transaction_id,
+            f"Expense claim {action}: {vendor_name}", f"مطالبة النفقات: {action_ar} ({vendor_name})",
+            f"Your claim {txn.transaction_id} was {action}. Remarks: {remarks or '-'}",
+            f"تم {action_ar} مطالبتك رقم {txn.transaction_id}. ملاحظات: {remarks or '-'}",
+            html_body_en=html,
+        )
+
+
+transaction_service = TransactionService()

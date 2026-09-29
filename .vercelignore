@@ -1,0 +1,2 @@
+# Vercel only hosts the website; the backend runs on its own server.
+backend/
